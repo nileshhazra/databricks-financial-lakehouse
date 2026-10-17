@@ -1,0 +1,4 @@
+azure-storage-blob>=12.20.0
+faker>=24.0.0
+python-dotenv>=1.0.0
+rich>=13.7.0
