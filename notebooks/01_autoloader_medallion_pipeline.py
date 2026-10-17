@@ -1,62 +1,96 @@
 # Databricks notebook source
 # ======================================================================================
 # AZURE DATABRICKS NOTEBOOK: Enterprise Financial Lakehouse
+# Platform: Databricks Serverless Compute + Unity Catalog Volumes
 # Description: Demonstrates end-to-end Medallion Architecture using Databricks Auto Loader:
+#              - Unity Catalog Volume as streaming landing zone (zero keys required)
 #              - Auto Loader (cloudFiles) streaming ingestion with schema inference
 #              - Bronze Delta Lake storage with trigger(availableNow=True)
 #              - Silver Curation (deduplication, timestamp parsing, validation)
 #              - Gold Business Marts (category risk & spend aggregations)
+#              - Schema Evolution verification (micro-batch with new fields)
 # ======================================================================================
 
 # COMMAND ----------
-# Cell 1: Configure ADLS Gen2 Storage Access
-# Replace <YOUR_STORAGE_KEY> with key1 from Azure Portal -> stretailnh -> Access keys
+# Cell 1: Define Unity Catalog Volume Paths (Zero Storage Keys Required!)
+VOLUME_PATH = "/Volumes/dbw_financial_lakehouse/default/raw_transactions"
+CHECKPOINT_PATH = f"{VOLUME_PATH}/_checkpoints/bronze"
+SCHEMA_PATH = f"{VOLUME_PATH}/_checkpoints/schema"
 
-STORAGE_ACCOUNT = "stretailnh"
-CONTAINER = "financial-data"
-STORAGE_KEY = "<YOUR_STORAGE_ACCOUNT_KEY>"
+BRONZE_TABLE = "dbw_financial_lakehouse.default.bronze_financial_transactions"
+SILVER_TABLE = "dbw_financial_lakehouse.default.silver_financial_transactions"
+GOLD_TABLE = "dbw_financial_lakehouse.default.gold_merchant_risk_summary"
 
-# Set Spark configuration for ABFSS authentication
-spark.conf.set(
-    f"fs.azure.account.key.{STORAGE_ACCOUNT}.dfs.core.windows.net",
-    STORAGE_KEY
-)
-
-print(f"ADLS Gen2 credentials configured for storage account: {STORAGE_ACCOUNT}")
+print("Unity Catalog Paths Configured:")
+print(f"  • Source Volume: {VOLUME_PATH}")
+print(f"  • Checkpoint:    {CHECKPOINT_PATH}")
 
 # COMMAND ----------
-# Cell 2: Define Storage Paths and Checkpoints
+# Cell 2: Synthetic Financial Stream Generator (Batch 01)
+# Writes micro-batch JSON drops directly into the Unity Catalog Volume using POSIX I/O
+import os
+import json
+import uuid
+import random
+from datetime import datetime, timezone
 
-SOURCE_PATH = f"abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net/raw_transactions"
-CHECKPOINT_PATH = f"abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net/checkpoints/bronze"
-SCHEMA_PATH = f"abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net/checkpoints/schema"
+MERCHANTS = [
+    ("Amazon Retail", "E-Commerce", 15.00, 450.00),
+    ("Apple Store", "Electronics", 50.00, 1200.00),
+    ("Uber Technologies", "Rideshare", 8.50, 65.00),
+    ("Starbucks Coffee", "Dining", 4.50, 18.00),
+    ("Delta Air Lines", "Travel", 180.00, 850.00),
+    ("Target Stores", "Retail", 20.00, 220.00),
+    ("Shell Gas Station", "Fuel", 30.00, 75.00),
+    ("Trader Joe's", "Groceries", 25.00, 160.00)
+]
 
-BRONZE_TABLE = "bronze_financial_transactions"
-SILVER_TABLE = "silver_financial_transactions"
-GOLD_TABLE = "gold_merchant_risk_summary"
+def generate_micro_batch(num_records=150, batch_filename="batch_01.json"):
+    now = datetime.now(timezone.utc).isoformat()
+    records = []
+    for _ in range(num_records):
+        merchant, cat, min_amt, max_amt = random.choice(MERCHANTS)
+        amount = round(random.uniform(min_amt, max_amt), 2)
+        is_fraud = 1 if (amount > 500 and random.random() < 0.15) or random.random() < 0.02 else 0
 
-print("Paths configured:")
-print(f"  • Source:     {SOURCE_PATH}")
-print(f"  • Checkpoint: {CHECKPOINT_PATH}")
+        records.append({
+            "transaction_id": f"TXN-{uuid.uuid4().hex[:12].upper()}",
+            "account_id": f"ACC-{random.randint(100000, 999999)}",
+            "customer_id": f"CUST-{random.randint(1000, 9999)}",
+            "amount": amount,
+            "currency": "USD",
+            "merchant_name": merchant,
+            "category": cat,
+            "timestamp": now,
+            "is_flagged_fraud": is_fraud
+        })
+
+    target_file = f"{VOLUME_PATH}/{batch_filename}"
+    with open(target_file, "w") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+    print(f"[+] Dropped micro-batch [{batch_filename}] with {num_records} transactions into Volume.")
+
+# Generate initial batch
+generate_micro_batch(150, "batch_01.json")
 
 # COMMAND ----------
 # Cell 3: Databricks Auto Loader (cloudFiles) Streaming Ingestion
 from pyspark.sql.functions import current_timestamp, input_file_name
 
-print("Starting Auto Loader streaming read from ADLS Gen2...")
+print("Starting Auto Loader streaming read from Unity Catalog Volume...")
 
-# Auto Loader automatically detects new files and manages schema evolution
+# Auto Loader (cloudFiles) handles streaming ingestion, schema inference & evolution
 df_autoloader_stream = spark.readStream.format("cloudFiles") \
     .option("cloudFiles.format", "json") \
     .option("cloudFiles.schemaLocation", SCHEMA_PATH) \
     .option("cloudFiles.inferColumnTypes", "true") \
     .option("cloudFiles.schemaEvolutionMode", "addNewColumns") \
-    .load(SOURCE_PATH) \
+    .load(VOLUME_PATH) \
     .withColumn("_ingested_at", current_timestamp()) \
     .withColumn("_source_file", input_file_name())
 
 # Write stream to Bronze Delta Table using trigger(availableNow=True)
-# Enterprise FinOps pattern: processes all available pending files and then stops compute
 query = df_autoloader_stream.writeStream \
     .format("delta") \
     .outputMode("append") \
@@ -74,13 +108,12 @@ print(f"Total raw records in [{BRONZE_TABLE}]: {df_bronze.count()}")
 display(df_bronze.limit(5))
 
 # COMMAND ----------
-# Cell 5: Silver Layer Curation (Deduplication & Schema Quality)
+# Cell 5: Silver Layer Curation (Deduplication & Quality Gating)
 from pyspark.sql.functions import col, row_number, to_timestamp
 from pyspark.sql.window import Window
 
 print("Building Silver Layer: deduplicating transactions and casting timestamps...")
 
-# Deduplicate in case multiple micro-batches included updates to the same transaction
 window_dedup = Window.partitionBy("transaction_id").orderBy(col("timestamp").desc())
 
 df_silver = df_bronze \
@@ -91,7 +124,6 @@ df_silver = df_bronze \
     .drop("_rn") \
     .withColumn("_curated_at", current_timestamp())
 
-# Save as Silver Delta Table
 df_silver.write \
     .format("delta") \
     .mode("overwrite") \
@@ -116,7 +148,6 @@ df_gold_risk = df_silver.groupBy("category") \
     ) \
     .orderBy(col("total_volume_usd").desc())
 
-# Save as Gold Delta Table
 df_gold_risk.write \
     .format("delta") \
     .mode("overwrite") \
