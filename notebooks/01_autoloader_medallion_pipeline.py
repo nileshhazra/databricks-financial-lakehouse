@@ -76,7 +76,7 @@ generate_micro_batch(150, "batch_01.json")
 
 # COMMAND ----------
 # Cell 3: Databricks Auto Loader (cloudFiles) Streaming Ingestion
-from pyspark.sql.functions import current_timestamp, input_file_name
+from pyspark.sql.functions import col, current_timestamp
 
 print("Starting Auto Loader streaming read from Unity Catalog Volume...")
 
@@ -88,13 +88,14 @@ df_autoloader_stream = spark.readStream.format("cloudFiles") \
     .option("cloudFiles.schemaEvolutionMode", "addNewColumns") \
     .load(VOLUME_PATH) \
     .withColumn("_ingested_at", current_timestamp()) \
-    .withColumn("_source_file", input_file_name())
+    .withColumn("_source_file", col("_metadata.file_path"))
 
 # Write stream to Bronze Delta Table using trigger(availableNow=True)
 query = df_autoloader_stream.writeStream \
     .format("delta") \
     .outputMode("append") \
     .option("checkpointLocation", CHECKPOINT_PATH) \
+    .option("mergeSchema", "true") \
     .trigger(availableNow=True) \
     .toTable(BRONZE_TABLE)
 

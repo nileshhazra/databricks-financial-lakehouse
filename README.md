@@ -80,10 +80,15 @@ python src/generate_financial_stream.py --batches 5 --records 100
 ```
 
 ### 2. Run the Databricks Medallion Pipeline
-1. In your **Azure Databricks Workspace**, import [notebooks/01_autoloader_medallion_pipeline.py](notebooks/01_autoloader_medallion_pipeline.py).
-2. Enter your storage account key in Cell 1.
-3. Click **Run all**.
-4. Observe Auto Loader streaming the files into `bronze_financial_transactions`, curating into `silver_financial_transactions`, and generating the `gold_merchant_risk_summary` mart!
+1. In your **Azure Databricks Workspace** (with Unity Catalog enabled), create a Volume: `/Volumes/<catalog>/<schema>/raw_transactions`.
+2. Import [notebooks/01_autoloader_medallion_pipeline.py](notebooks/01_autoloader_medallion_pipeline.py) into your Databricks workspace.
+3. Attach to **Serverless Compute** (zero infrastructure setup).
+4. Run the notebook cells sequentially:
+   - Cell 2 drops `batch_01.json` (150 records) directly into the Volume.
+   - Cell 3 triggers Auto Loader to stream from the Volume into Bronze with schema inference.
+   - Cells 4 & 5 curate into Silver (deduplicated) and Gold (risk aggregations).
+   - Cell 6 drops `batch_02.json` (100 records) introducing schema evolution (`loyalty_points`, `device_channel`).
+   - Cell 7 reruns Auto Loader with `mergeSchema=true` to seamlessly evolve the Bronze Delta table to 250 records!
 
 ---
 
